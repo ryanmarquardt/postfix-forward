@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+
+import argparse
+import base64
+import os
+import sys
+from subprocess import Popen,PIPE
+
+from postfix_forward import *
+
+parser = argparse.ArgumentParser()
+
+parser.set_defaults(
+	admin_user = 'root', admin_password = None,
+	view_user = 'postfix', view_password = None,
+	edit_user = 'postfix_editor', edit_password = None,
+	database = 'postfix', table = 'aliases',
+	alias_path = 'aliases.cf',
+	domain_path = 'domains.cf',
+	db = 'mysql',
+)
+
+args = parser.parse_args()
+if args.db == 'mysql':
+	if not args.admin_password:
+		args.admin_password = read_password("Enter mysql password for %s:" % args.admin_user)
+	if not args.edit_password:
+		print >>sys.stderr, 'Generating password for %s:' % args.edit_user,
+		args.edit_password = base64.b64encode(open('/dev/random','rb').read(48))
+		print >>sys.stderr, args.edit_password
+	if not args.view_password:
+		print >>sys.stderr, 'Generating password for %s' % args.view_user,
+		args.view_password = base64.b64encode(open('/dev/random','rb').read(48))
+		print >>sys.stderr, args.view_password
+
+postconf_dir = '/etc/postfix/vhost'
+
+postconf = {
+	'mydestination':'',
+	'virtual_alias_maps':'%s:%s' % (args.db, os.path.join(postconf_dir,args.alias_path)),
+	'virtual_alias_domains':'%s:%s' % (args.db, os.path.join(postconf_dir,args.domain_path)),
+}
+
+if args.db == 'mysql':
+	cf_template = '''hosts = 127.0.0.1\nuser = %(view_user)s\npassword = %(view_password)s
+	dbname = %(database)s\nquery = SELECT %(0)s FROM %(table)s WHERE %(1)s='%%s'\n'''
+	concat = "CONCAT(user,'@',domain)"
+	db = mysql(host='localhost', user=args.admin_user, passwd=args.admin_password)
+
+with db:
+	if hasattr(db, 'create_database'):
+		db.create_database(args.database)
+		db.execute('USE %s;' % args.database)
+	db.create_table(args.table,
+		Field('name', length=255, notnull=True, default=''),
+		Field('domain', length=255, notnull=True, default=''),
+		Field('address', length=255, notnull=True, default=''),
+		primarykeys = ['user', 'domain'],
+	)
+	if args.db == 'mysql':
+		db.execute('''GRANT SELECT ON %(database)s.%(table)s
+	TO %(view_user)s@localhost IDENTIFIED BY '%(view_password)s';''' % vars(args))
+		db.execute('''GRANT SELECT, INSERT, DELETE, UPDATE ON %(database)s.%(table)s
+	TO %(edit_user)s@localhost IDENTIFIED BY '%(edit_password)s';''' % vars(args))
+		db.execute('FLUSH PRIVILEGES;')
+
+for item in postconf.items():
+	Popen(['postconf', '-e', '%s = %s' % item]).communicate()
+if not os.path.exists(postconf_dir):
+	os.mkdir(postconf_dir)
+for f,s,w in ((args.domain_path, 'domain', 'domain'), (args.alias_path, 'address', concat)):
+	v = dict(map(lambda x:(str(x[0]),x[1]),enumerate((s,w))))
+	v.update(vars(args))
+	open(os.path.join(postfix_conf_dir,f),'w').write(cf_template % v)
+if args.db == 'mysql':
+	open(edit_credentials_path,'w').write('user = %(edit_user)s\npassword = %(edit_password)s' % vars(args))
+	os.chmod(edit_credentials_path, 0400)

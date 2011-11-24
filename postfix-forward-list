@@ -1,0 +1,26 @@
+#!/usr/bin/env python
+
+import argparse
+
+from postfix_forward import *
+
+parser = argparse.ArgumentParser()
+parser.add_argument('match', nargs='?', default=None)
+parser.set_defaults(
+	db = 'mysql'
+)
+args = parser.parse_args()
+
+if args.db == 'mysql':
+	db = mysql_viewer()
+	def concat(*names):
+		return 'CONCAT(%s)' % ','.join(names)
+if args.match:
+	rows = list(db.aliases.select('address', goto=args.match))
+	if rows: print '\n'.join(x[0] for x in rows)
+	else:
+		rows = list(db.aliases.select(concat(db.aliases.name, '@', db.aliases.domain), address=args.match))
+		if rows: print '\n'.join(x[0] for x in rows)
+else:
+	for orig,address in db.aliases.select(concat(db.aliases.name,'@',db.aliases.domain), db.aliases.address):
+		print orig, '->', address
