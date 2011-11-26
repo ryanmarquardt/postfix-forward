@@ -1,0 +1,128 @@
+#!/usr/bin/env python
+
+import argparse
+from postfix_forward import *
+
+#COMMAND = {
+	#'pff-list':'list',
+	#'pff-add':'add',
+	#'pff-remove':'remove',
+	#'pff-install':'install',
+#}.get(sys.argv[0])
+#if not COMMAND:
+	#COMMAND = sys.argv[1]
+
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--user', '-u')
+	parser.set_defaults(
+		user = None,
+		password = None,
+		host = 'localhost',
+		db = 'mysql',
+	)
+
+	subparsers = parser.add_subparsers()
+	parser_add = subparsers.add_parser('add')
+
+	parser = argparse.ArgumentParser()
+	parser_add.add_argument('orig', nargs='+')
+	parser_add.add_argument('address')
+	parser_add.set_defaults(func=Add)
+
+	parser_list = subparsers.add_parser('list')
+	parser_list.add_argument('match', nargs='?', default=None)
+	parser_list.set_defaults(func=List)
+
+	parser_remove = subparsers.add_parser('remove')
+	parser_remove.add_argument('address', nargs='+')
+	parser_remove.set_defaults(func=Remove)
+
+	parser_install = subparsers.add_parser('install')
+	parser_install.set_defaults(
+		func = Install, user = 'root',
+		view_user = 'postfix', view_password = None,
+		edit_user = 'postfix_editor', edit_password = None,
+		database = 'postfix', table = 'aliases',
+		alias_path = 'aliases.cf', domain_path = 'domains.cf',
+	)
+
+	args = parser.parse_args()
+	args.func(args)
+
+def Add(args):
+	for address in args.orig + [args.address]:
+		if not is_email(address):
+			raise ValueError('Expected email address: %s' % address)
+	with DATABASES[args.db].editor(**vars(args)) as db:
+		for address in args.orig:
+			name,_,domain = address.partition('@')
+			db.insert('aliases', name=name, domain=domain, address=args.address)
+
+def Remove(args):
+	with DATABASES[args.db].editor(**vars(args)) as db:
+		for address in args.address:
+			if not is_email(address):
+				raise ValueError('Expected email address: %s' % address)
+			user,domain=address.partition('@')[::2]
+			db.delete('aliases', user=user, domain=domain)
+
+def List(args):
+	db = DATABASES[args.db].viewer(**vars(args))
+	email = db.concat(db.Field('name'),'@',db.Field('domain'))
+	if args.match:
+		print '\n'.join(x[0] for x in \
+		  list(db.select('aliases', 'address', **{email:args.match})) or \
+		  list(db.select('aliases', email, address=args.match)))
+	else:
+		for orig,address in db.select('aliases', email, db.aliases.address):
+			print orig, '->', address
+
+def Install(args):
+	import base64
+	import os
+	import sys
+	from subprocess import Popen,PIPE
+
+	if hasattr(db,'create_user'):
+		if not args.admin_password:
+			args.admin_password = read_password("Enter mysql password for %s:" % args.admin_user)
+		if not args.edit_password:
+			print >>sys.stderr, 'Generating password for %s:' % args.edit_user,
+			args.edit_password = base64.b64encode(open('/dev/random','rb').read(48))
+			print >>sys.stderr, args.edit_password
+		if not args.view_password:
+			print >>sys.stderr, 'Generating password for %s' % args.view_user,
+			args.view_password = base64.b64encode(open('/dev/random','rb').read(48))
+			print >>sys.stderr, args.view_password
+
+	args.user,args.password = args.admin_user,args.admin_password
+	db = DATABASES[args.db](**vars(args))
+
+	with db:
+		if hasattr(db, 'create_database'):
+			db.create_database(args.database)
+			db.execute('USE %s;' % args.database)
+	with db:
+		db.create_table(args.table, EmailField('name'), Field('domain'),
+		  Field('address'), primarykeys = ['user', 'domain'])
+	if hasattr(db,'create_user'):
+		with db:
+			db.create_user(args.view_user, args.view_password, ['SELECT'], args.database+'.'+args.table)
+			db.create_user(args.edit_user, args.edit_password, ['SELECT','INSERT','DELETE','UPDATE'], args.database+'.'+args.table)
+
+	pc = Postconf()
+	pc.mydestination = ''
+	pc.virtual_alias_maps = '%s:%s' % (args.db, os.path.join(postconf_dir,args.alias_path)),
+	pc.virtual_alias_domains = '%s:%s' % (args.db, os.path.join(postconf_dir,args.domain_path)),
+
+	if not os.path.exists(postconf_dir):
+		os.makedirs(postconf_dir)
+	open(os.path.join(postfix_conf_dir,args.domain_path),'w').write(db.postfix_conf(args, 'domain', 'domain'))
+	open(os.path.join(postfix_conf_dir,args.alias_path),'w').write(db.postfix_conf(args, 'address', db.concat("user","'@'","domain")))
+	if hasattr(db, 'create_user'):
+		open(edit_credentials_path,'w').write('user = %(edit_user)s\npassword = %(edit_password)s' % vars(args))
+		os.chmod(edit_credentials_path, 0400)
+
+if __name__=='__main__':
+	main()

@@ -1,78 +1,37 @@
 #!/usr/bin/env python
 
-import MySQLdb
 import os
+import re
 import sys
 import termios
 
-def read_password(prompt, f=sys.stdin):
-	try:
-		new,old = termios.tcgetattr(f),termios.tcgetattr(f)
-		new[3] &= ~termios.ECHO
-		termios.tcsetattr(sys.stdin, termios.TCSANOW, new)
-		r = raw_input(prompt)
-		print
-	finally:
-		termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, old)
-	return r
-
-postfix_conf_dir = '/etc/postfix/vhost'
-alias_path = os.path.join(postfix_conf_dir, 'aliases.cf')
-edit_credentials_path = os.path.join(postfix_conf_dir, 'edit_credentials.cf')
-try:
-	viewer = dict(map(str.strip,line.split('=',1)) for line in open(alias_path).read().split('\n') if line.strip())
-except:
-	viewer = {}
-try:
-	editor = dict(map(str.strip,line.split('=',1)) for line in open(edit_credentials_path).read().split('\n') if line.strip())
-except:
-	editor = {}
-
-def concat(*names):
-	return 'CONCAT(%s)' % ','.join(map(repr,names))
-
-class Expression(list):
-	def __init__(self, *tokens): list.__init__(self, tokens)
-	def __repr__(self): return ''.join(self)
-
-	def __eq__(self, x): return self + Expression('=') + Expression(x)
-
-class Field(Expression):
-	def __init__(self, name, type=str, length=512, notnull=False, default=None, required=False):
-		self.name = name
-		self.type = type
-		self.length = length
-		self.notnull = ' NOT NULL' if notnull else ''
-		self.default = ' DEFAULT %r' % default if not required else ''
-		self.required = required
-		self.type_name = {
-			str:'VARCHAR(%s)'
-		}[type] % vars(self)
-
-	def sql(self):
-		return '%(name)s %(type_name)s%(notnull)s%(default)s' % vars(self)
-
-	def __str__(self):
-		return self.name
+email_regex = '[A-Za-z0-9_+.-]+@[a-zA-Z0-9_+.-]+'
+def is_email(s):
+	return bool(re.match(email_regex, s))
 
 class DB(object):
-	def __init__(self):
+	class Field(str): __repr__=__str__
+
+	def __init__(self, adapter):
 		self._depth = 0
 
 	def __enter__(self):
 		self._depth += 1
+		return self
 
 	def __exit__(self, exc, obj, tb):
 		self._depth -= 1
 		if self._depth == 0:
 			if exc:
-				self._conn.rollback()
+				self.rollback()
 			else:
-				self._conn.commit()
+				self.commit()
 
-	def __getattr__(self, name):
-		if name not in self.__dict__:
-			return Table(self, name)
+	def commit(self):
+		self._conn.commit()
+
+	def rollback(self):
+		self._conn.rollback()
 
 	def execute(self, query, values=()):
 		cursor = self._conn.cursor()
@@ -80,24 +39,28 @@ class DB(object):
 			cursor.execute(query, values)
 		return cursor
 
-class Table(object):
-	def __init__(self, db, name):
-		self._db = db
-		self._name = name
-
-	def insert(self, **values):
-		self._db.insert(self._name, **values)
-
-	def __getattr__(self, name):
-		if name not in self.__dict__:
-			return Field(self, name)
+def EmailField(name):
+		return "%s VARCHAR(255) NOT NULL DEFAULT ''" % name
 
 class mysql(DB):
-	def __init__(self, host='localhost', user='root', passwd=None, db=''):
+	def __init__(self, **kwargs):
 		DB.__init__(self)
-		self.user = user
-		self.passwd = passwd
-		self._conn = MySQLdb.connect(host=host, user=user, passwd=passwd, db=db)
+		self._conn = MySQLdb.connect(
+			host=kwargs.get('host') or 'localhost',
+			user=kwargs.get('user') or 'root',
+			passwd=kwargs.get('password'),
+			db=kwargs.get('db'),
+		)
+		self._modified_user = False
+
+	def commit(self):
+		self._modified_user = False
+		self.execute('FLUSH PRIVILEGES;')
+		DB.commit(self)
+
+	def rollback(self):
+		self._modified_user = False
+		DB.rollback(self)
 
 	def create_database(self, name):
 		self.execute("CREATE DATABASE %s;" % name)
@@ -109,6 +72,13 @@ class mysql(DB):
 			query += ', PRIMARY KEY (%s)' % ','.join(primarykeys)
 		query += ');'
 		self.execute(query)
+
+	def create_user(self, user, password, perms, on_table):
+		self._modified_user = True
+		self.execute('''GRANT %(perms)s ON %(table)s
+		TO %(user)s IDENTIFIED BY '%(password)s';''' % {
+			'perms':', '.join(perms), 'table':on_table, 'password':password,
+			'user':user if '@' in user else user+'@localhost'})
 
 	def insert(self, table, **values):
 		query = "INSERT INTO %(table)s(%(names)s) VALUES(%(values)s) \
@@ -135,12 +105,57 @@ ON DUPLICATE KEY UPDATE %(update)s;" % {
 		}
 		self.execute(query, where.values())
 
-def mysql_viewer(user=None, passwd=None):
-	user = user or viewer.get('user','postfix')
-	passwd = passwd or viewer.get('password') or read_password("Enter mysql password for %s:" % user)
-	return mysql(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
+	@classmethod
+	def viewer(cls, user=None, passwd=None):
+		user = user or viewer.get('user','postfix')
+		passwd = passwd or viewer.get('password') or read_password("Enter mysql password for %s:" % user)
+		return cls(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
 
-def mysql_editor(user=None, passwd=None):
-	user = user or editor.get('user','postfix_editor')
-	passwd = passwd or editor.get('password') or read_password("Enter mysql password for %s:" % user)
-	return mysql(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
+	@classmethod
+	def editor(cls, user=None, passwd=None):
+		user = user or editor.get('user','postfix_editor')
+		passwd = passwd or editor.get('password') or read_password("Enter mysql password for %s:" % user)
+		return cls(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
+
+	@staticmethod
+	def concat(*names):
+		return 'CONCAT(%s)' % ','.join(names)
+
+	@staticmethod
+	def postfix_conf(args, key, value):
+		cf_template = '''hosts = 127.0.0.1\nuser = %(view_user)s\npassword = %(view_password)s
+		dbname = %(database)s\nquery = SELECT %(0)s FROM %(table)s WHERE %(1)s='%%s'\n'''
+		return cf_template % dict(vars(args).items() + (('0',key),('1',value)))
+
+class Postconf(object):
+	def set(self, key, value):
+		Popen(['postconf', '-e', '%s = %s' % (key,value)]).communicate()
+	__setitem__ = set
+	__setattr__ = set
+
+def read_password(prompt, f=sys.stdin):
+	try:
+		new,old = termios.tcgetattr(f),termios.tcgetattr(f)
+		new[3] &= ~termios.ECHO
+		termios.tcsetattr(sys.stdin, termios.TCSANOW, new)
+		r = raw_input(prompt)
+		print
+	finally:
+		termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, old)
+	return r
+
+postfix_conf_dir = '/etc/postfix/vhost'
+alias_path = os.path.join(postfix_conf_dir, 'aliases.cf')
+edit_credentials_path = os.path.join(postfix_conf_dir, 'edit_credentials.cf')
+try:
+	viewer = dict(map(str.strip,line.split('=',1)) for line in open(alias_path).read().split('\n') if line.strip())
+except:
+	viewer = {}
+try:
+	editor = dict(map(str.strip,line.split('=',1)) for line in open(edit_credentials_path).read().split('\n') if line.strip())
+except:
+	editor = {}
+
+DATABASES = {
+	'mysql':mysql,
+}
