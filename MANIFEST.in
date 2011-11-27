@@ -1,0 +1,4 @@
+include COPYING
+include TODO
+include debian/*
+include debian/*/*
