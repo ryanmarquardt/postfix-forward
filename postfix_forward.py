@@ -2,17 +2,24 @@
 
 import os
 import re
+from subprocess import Popen,PIPE
 import sys
 import termios
+import traceback
+
+class namespace(object):
+	def __init__(self, **kwargs):
+		for k in kwargs:
+			setattr(self, k, kwargs[k])
 
 email_regex = '[A-Za-z0-9_+.-]+@[a-zA-Z0-9_+.-]+'
 def is_email(s):
 	return bool(re.match(email_regex, s))
 
 class DB(object):
-	class Field(str): __repr__=__str__
+	class Field(str): __repr__=str.__str__
 
-	def __init__(self, adapter):
+	def __init__(self):
 		self._depth = 0
 
 	def __enter__(self):
@@ -40,22 +47,38 @@ class DB(object):
 		return cursor
 
 def EmailField(name):
-		return "%s VARCHAR(255) NOT NULL DEFAULT ''" % name
+	return "%s VARCHAR(255) NOT NULL DEFAULT ''" % name
+
+class AuthError(Exception): pass
+class DatabaseExists(Exception): pass
+class TableExists(Exception): pass
 
 class mysql(DB):
 	def __init__(self, **kwargs):
-		DB.__init__(self)
-		self._conn = MySQLdb.connect(
-			host=kwargs.get('host') or 'localhost',
-			user=kwargs.get('user') or 'root',
-			passwd=kwargs.get('password'),
-			db=kwargs.get('db'),
+		import MySQLdb
+		self._exceptions = namespace(
+			OperationalError = MySQLdb.OperationalError,
+			ProgrammingError = MySQLdb.ProgrammingError,
 		)
-		self._modified_user = False
+		DB.__init__(self)
+		try:
+			self._conn = MySQLdb.connect(
+				host=kwargs.get('host') or 'localhost',
+				user=kwargs.get('user') or 'root',
+				passwd=kwargs.get('password'),
+				db=kwargs.get('db'),
+			)
+			self._modified_user = False
+		except MySQLdb.OperationalError, e:
+			if e.args[0] == 1045:
+				raise AuthError(e.args[1])
+			else:
+				raise
 
 	def commit(self):
-		self._modified_user = False
-		self.execute('FLUSH PRIVILEGES;')
+		if self._modified_user:
+			self._modified_user = False
+			self.execute('FLUSH PRIVILEGES;')
 		DB.commit(self)
 
 	def rollback(self):
@@ -63,7 +86,11 @@ class mysql(DB):
 		DB.rollback(self)
 
 	def create_database(self, name):
-		self.execute("CREATE DATABASE %s;" % name)
+		try:
+			self.execute("CREATE DATABASE %s;" % name)
+		except self._exceptions.ProgrammingError, e:
+			if e.args[0] == 1007: raise DatabaseExists
+			else: raise
 
 	def create_table(self, name, *fields, **options):
 		primarykeys = options.get('primarykeys')
@@ -71,7 +98,11 @@ class mysql(DB):
 		if primarykeys:
 			query += ', PRIMARY KEY (%s)' % ','.join(primarykeys)
 		query += ');'
-		self.execute(query)
+		try:
+			self.execute(query)
+		except self._exceptions.OperationalError, e:
+			if e.args[0] == 1050: raise TableExists
+			else: raise
 
 	def create_user(self, user, password, perms, on_table):
 		self._modified_user = True
@@ -106,16 +137,17 @@ ON DUPLICATE KEY UPDATE %(update)s;" % {
 		self.execute(query, where.values())
 
 	@classmethod
-	def viewer(cls, user=None, passwd=None):
-		user = user or viewer.get('user','postfix')
-		passwd = passwd or viewer.get('password') or read_password("Enter mysql password for %s:" % user)
-		return cls(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
+	def viewer(cls, **kwargs):
+		user = kwargs.get('user') or viewer.get('user','postfix')
+		password = kwargs.get('password') or viewer.get('password') or read_password("Enter mysql password for %s:" % user)
+		print user, password
+		return cls(host='127.0.0.1', user=user, password=password, db=viewer.get('dbname','postfix'))
 
 	@classmethod
-	def editor(cls, user=None, passwd=None):
-		user = user or editor.get('user','postfix_editor')
-		passwd = passwd or editor.get('password') or read_password("Enter mysql password for %s:" % user)
-		return cls(host='127.0.0.1', user=user, passwd=passwd, db=viewer.get('dbname','postfix'))
+	def editor(cls, **kwargs):
+		user = kwargs.get('user') or editor.get('user','postfix_editor')
+		password = kwargs.get('password') or editor.get('password') or read_password("Enter mysql password for %s:" % user)
+		return cls(host='127.0.0.1', user=user, password=password, db=viewer.get('dbname','postfix'))
 
 	@staticmethod
 	def concat(*names):
@@ -123,15 +155,26 @@ ON DUPLICATE KEY UPDATE %(update)s;" % {
 
 	@staticmethod
 	def postfix_conf(args, key, value):
+		print dict(args)
 		cf_template = '''hosts = 127.0.0.1\nuser = %(view_user)s\npassword = %(view_password)s
-		dbname = %(database)s\nquery = SELECT %(0)s FROM %(table)s WHERE %(1)s='%%s'\n'''
-		return cf_template % dict(vars(args).items() + (('0',key),('1',value)))
+dbname = %(database)s\nquery = SELECT %(0)s FROM %(table)s WHERE %(1)s='%%s'\n'''
+		params = dict(args.items() + [('0',key),('1',value)])
+		return cf_template % params
 
 class Postconf(object):
 	def set(self, key, value):
-		Popen(['postconf', '-e', '%s = %s' % (key,value)]).communicate()
+		Popen(['postconf', '-e', '%s = %s' % (key, value)]).communicate()
 	__setitem__ = set
 	__setattr__ = set
+
+	def get(self, key):
+		stdout, stderr = Popen(['postconf','-h',key], stdout=PIPE, stderr=PIPE).communicate()
+		if stderr:
+			raise KeyError
+		else:
+			return stdout[:-1]
+	__getattr__ = get
+	__getitem__ = get
 
 def read_password(prompt, f=sys.stdin):
 	try:
@@ -150,10 +193,12 @@ edit_credentials_path = os.path.join(postfix_conf_dir, 'edit_credentials.cf')
 try:
 	viewer = dict(map(str.strip,line.split('=',1)) for line in open(alias_path).read().split('\n') if line.strip())
 except:
+	traceback.print_exc()
 	viewer = {}
 try:
 	editor = dict(map(str.strip,line.split('=',1)) for line in open(edit_credentials_path).read().split('\n') if line.strip())
 except:
+	traceback.print_exc()
 	editor = {}
 
 DATABASES = {
